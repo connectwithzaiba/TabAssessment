@@ -1,0 +1,1110 @@
+"""
+tableau_migration_assessment.py
+================================
+Starter script for Tableau On-prem -> Power BI migration assessment.
+
+Combines five data sources into a single Excel deliverable:
+  1. Tableau Server REST API           (via `tableauserverclient` / TSC)
+  2. Tableau Metadata API              (GraphQL endpoint /api/metadata/graphql)
+  3. Workbook XML parsing              (.twb / .twbx unzipped)
+  4. Tableau Repository (PostgreSQL)   (the "workgroup" database, readonly user)
+  5. Excel multi-tab output            (pandas + openpyxl)
+
+USAGE
+-----
+    # one-shot: run every phase
+    python tableau_migration_assessment.py --phase all
+
+    # or run phases individually (each phase writes intermediate CSVs to ./staging)
+    python tableau_migration_assessment.py --phase inventory   # REST + Metadata API
+    python tableau_migration_assessment.py --phase download    # download all .twbx
+    python tableau_migration_assessment.py --phase parse       # parse workbook XML
+    python tableau_migration_assessment.py --phase repo        # PostgreSQL queries
+    python tableau_migration_assessment.py --phase score       # compute scores
+    python tableau_migration_assessment.py --phase report      # build Excel deliverable
+
+CONFIG
+------
+Edit auth_config.py (in the same folder) and set:
+
+    SERVER_URL   — e.g. https://tableau.yourcompany.com
+    VERIFY_SSL   — False when the server uses a self-signed certificate
+
+Credentials are prompted at runtime (username + masked password).
+No PAT, no secrets file, no environment variables required for auth.
+
+Optional PostgreSQL repo phase — set these environment variables or .env:
+
+    REPO_HOST               Tableau Server primary node hostname
+    REPO_PORT               8060 (default) or 8061 if TLS enforced
+    REPO_DB                 workgroup
+    REPO_USER               readonly
+    REPO_PASSWORD           the password you set with `tsm data-access repository-access enable`
+
+    STAGING_DIR             ./staging  (intermediate CSVs and downloaded workbooks)
+    OUTPUT_XLSX             ./Tableau_Migration_Assessment.xlsx
+
+SITES
+-----
+List site contentUrls (one per line) in sites.txt next to this script.
+Use "Default" or leave a line blank for the Default site.
+Or pass --site / --all-sites on the command line.
+
+REQUIREMENTS
+------------
+    pip install -r requirements.txt
+
+NOTES
+-----
+* Tested against Tableau Server 2023.x and 2024.x. The repository schema
+  is undocumented and may change between major versions -- adjust the
+  SQL in tableau_repository_queries.sql if columns are missing.
+* Workbook downloads use `no_extract=True` so the .hyper data is skipped,
+  keeping each .twbx 10-50x smaller. We only need the XML.
+* Be a polite citizen: this script throttles GraphQL paging and REST calls.
+  Run it off-hours on production.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import logging
+import os
+import re
+import sys
+import zipfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Iterable
+
+import pandas as pd
+import requests
+from lxml import etree
+
+try:
+    import tableauserverclient as TSC
+except ImportError:
+    print("ERROR: pip install tableauserverclient", file=sys.stderr)
+    raise
+
+from auth_config import get_server  # shared auth: username/password + SSL handling
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+DEFAULTS = {
+    # Tableau repository (PostgreSQL) — optional; skip if REPO_PASSWORD is blank
+    "REPO_HOST":     os.getenv("REPO_HOST", "tableau.example.com"),
+    "REPO_PORT":     int(os.getenv("REPO_PORT", "8060")),
+    "REPO_DB":       os.getenv("REPO_DB", "workgroup"),
+    "REPO_USER":     os.getenv("REPO_USER", "readonly"),
+    "REPO_PASSWORD": os.getenv("REPO_PASSWORD", ""),
+
+    "STAGING_DIR":   Path(os.getenv("STAGING_DIR", "./staging")).resolve(),
+    "OUTPUT_XLSX":   Path(os.getenv("OUTPUT_XLSX", "./Tableau_Migration_Assessment.xlsx")).resolve(),
+    "SQL_FILE":      Path(os.getenv("SQL_FILE", "./tableau_repository_queries.sql")).resolve(),
+}
+
+# Default site list file — same file used by extract_inventory.py
+HARDCODED_SITES_FILE = Path(os.getenv("SITES_FILE", "./sites.txt")).resolve()
+
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+log = logging.getLogger("tableau_assess")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def staging_path(name: str) -> Path:
+    DEFAULTS["STAGING_DIR"].mkdir(parents=True, exist_ok=True)
+    return DEFAULTS["STAGING_DIR"] / name
+
+
+def write_csv(rows: list[dict], filename: str) -> Path:
+    path = staging_path(filename)
+    if not rows:
+        log.warning("No rows for %s", filename)
+        path.write_text("")
+        return path
+    df = pd.DataFrame(rows)
+    df.to_csv(path, index=False, quoting=csv.QUOTE_MINIMAL)
+    log.info("Wrote %s (%d rows)", path.name, len(df))
+    return path
+
+
+def read_csv(filename: str) -> pd.DataFrame:
+    path = staging_path(filename)
+    if not path.exists() or path.stat().st_size == 0:
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+
+# ---------------------------------------------------------------------------
+# 1. Tableau REST API client (via TSC) + Metadata API (GraphQL)
+# ---------------------------------------------------------------------------
+
+class TableauClient:
+    """Thin wrapper around TSC + Metadata API.
+
+    Auth and SSL are handled by auth_config.get_server().
+    """
+
+    def __init__(self, site_id: str = ""):
+        self.site_id = site_id
+        self._server: TSC.Server | None = None
+        self._signed_in = False
+
+    @property
+    def server(self) -> TSC.Server:
+        assert self._server is not None, "TableauClient must be used as a context manager (with statement)"
+        return self._server
+
+    def __enter__(self):
+        self._server, _auth = get_server(site_id_override=self.site_id)
+        self._server.auth.sign_in(_auth)
+        self._signed_in = True
+        log.info("Signed in to site '%s' (api %s)", self.site_id or "Default", self._server.version)
+        return self
+
+    def __exit__(self, *exc):
+        if self._signed_in and self._server:
+            self._server.auth.sign_out()
+
+    # ---- REST: inventory ---------------------------------------------------
+
+    def list_workbooks(self) -> list[dict]:
+        rows: list[dict] = []
+        for wb in TSC.Pager(self.server.workbooks):
+            try:
+                self.server.workbooks.populate_views(wb, usage=True)
+                self.server.workbooks.populate_connections(wb)
+            except Exception as e:
+                log.warning("populate_* failed for wb %s: %s", wb.id, e)
+
+            rows.append({
+                "wb_id":        wb.id,
+                "wb_name":      wb.name,
+                "wb_content_url": wb.content_url,
+                "project_id":   wb.project_id,
+                "project_name": wb.project_name,
+                "owner_id":     wb.owner_id,
+                "created_at":   wb.created_at,
+                "updated_at":   wb.updated_at,
+                "size_bytes":   wb.size,
+                "tags":         ",".join(sorted(wb.tags or [])),
+                "show_tabs":    wb.show_tabs,
+                "webpage_url":  wb.webpage_url,
+                "view_count":   len(wb.views or []),
+                "connection_count": len(wb.connections or []),
+            })
+        return rows
+
+    def list_views(self) -> list[dict]:
+        rows: list[dict] = []
+        for v in TSC.Pager(self.server.views, usage=True):
+            rows.append({
+                "view_id":         v.id,
+                "view_name":       v.name,
+                "wb_id":           v.workbook_id,
+                "project_id":      v.project_id,
+                "owner_id":        v.owner_id,
+                "content_url":     v.content_url,
+                "total_views":     v.total_views,
+                "created_at":      v.created_at,
+                "updated_at":      v.updated_at,
+                "tags":            ",".join(sorted(v.tags or [])),
+            })
+        return rows
+
+    def list_datasources(self) -> list[dict]:
+        rows: list[dict] = []
+        for ds in TSC.Pager(self.server.datasources):
+            try:
+                self.server.datasources.populate_connections(ds)
+            except Exception as e:
+                log.warning("populate_connections failed for ds %s: %s", ds.id, e)
+            for c in (ds.connections or [None]):
+                rows.append({
+                    "ds_id":          ds.id,
+                    "ds_name":        ds.name,
+                    "ds_type":        ds.datasource_type,
+                    "project_id":     ds.project_id,
+                    "project_name":   ds.project_name,
+                    "owner_id":       ds.owner_id,
+                    "is_certified":   getattr(ds, "certified", None),
+                    "use_remote_query_agent": getattr(ds, "use_remote_query_agent", None),
+                    "has_extracts":   getattr(ds, "has_extracts", None),
+                    "created_at":     ds.created_at,
+                    "updated_at":     ds.updated_at,
+                    "conn_id":        getattr(c, "id", None),
+                    "conn_type":      getattr(c, "connection_type", None),
+                    "conn_server":    getattr(c, "server_address", None),
+                    "conn_port":      getattr(c, "server_port", None),
+                    "conn_username":  getattr(c, "username", None),
+                    "conn_embed_password": getattr(c, "embed_password", None),
+                })
+        return rows
+
+    def list_users(self) -> list[dict]:
+        rows: list[dict] = []
+        for u in TSC.Pager(self.server.users):
+            rows.append({
+                "user_id":   u.id,
+                "name":      u.name,
+                "fullname":  u.fullname,
+                "email":     u.email,
+                "site_role": u.site_role,
+                "auth_setting": u.auth_setting,
+                "last_login": u.last_login,
+                "external_auth_user_id": getattr(u, "external_auth_user_id", None),
+            })
+        return rows
+
+    def list_groups(self) -> list[dict]:
+        rows: list[dict] = []
+        for g in TSC.Pager(self.server.groups):
+            try:
+                self.server.groups.populate_users(g)
+            except Exception as e:
+                log.warning("populate_users failed for group %s: %s", g.id, e)
+                continue
+            members = [u.id for u in (g.users or [])]
+            for uid in members or [None]:
+                rows.append({
+                    "group_id": g.id, "group_name": g.name,
+                    "domain":   getattr(g.domain, "name", None) if g.domain else None,
+                    "user_id":  uid,
+                })
+        return rows
+
+    def list_subscriptions(self) -> list[dict]:
+        rows: list[dict] = []
+        try:
+            for s in TSC.Pager(self.server.subscriptions):
+                rows.append({
+                    "sub_id":      s.id,
+                    "subject":     s.subject,
+                    "user_id":     s.user_id,
+                    "schedule_id": getattr(s, "schedule_id", None),
+                    "target_type": getattr(s.target, "type", None) if s.target else None,
+                    "target_id":   getattr(s.target, "id", None) if s.target else None,
+                    "attach_pdf":  getattr(s, "attach_pdf", None),
+                    "attach_image": getattr(s, "attach_image", None),
+                })
+        except Exception as e:
+            log.warning("subscriptions endpoint failed: %s", e)
+        return rows
+
+    def list_schedules(self) -> list[dict]:
+        rows: list[dict] = []
+        try:
+            for sch in TSC.Pager(self.server.schedules):
+                rows.append({
+                    "schedule_id": sch.id,
+                    "name":        sch.name,
+                    "schedule_type": sch.schedule_type,
+                    "frequency":   sch.frequency,
+                    "next_run_at": sch.next_run_at,
+                    "state":       sch.state,
+                    "priority":    sch.priority,
+                })
+        except Exception as e:
+            log.warning("schedules endpoint failed: %s", e)
+        return rows
+
+    def list_permissions(self, content_items: Iterable[Any], populate, kind: str) -> list[dict]:
+        """Flatten permissions for any content type (workbook/view/datasource/project)."""
+        rows: list[dict] = []
+        for item in content_items:
+            try:
+                populate(item)
+            except Exception as e:
+                log.warning("permission populate failed (%s %s): %s", kind, item.id, e)
+                continue
+            for rule in (item.permissions or []):
+                grantee = rule.grantee
+                for cap_name, cap_mode in (rule.capabilities or {}).items():
+                    rows.append({
+                        "object_kind": kind,
+                        "object_id":   item.id,
+                        "object_name": getattr(item, "name", None),
+                        "grantee_type": getattr(grantee, "tag_name", None),
+                        "grantee_id":  grantee.id,
+                        "capability":  cap_name,
+                        "mode":        cap_mode,
+                    })
+        return rows
+
+    # ---- Metadata API (GraphQL) -------------------------------------------
+
+    def metadata_query(self, query: str, variables: dict | None = None) -> dict:
+        url = f"{self.server.server_address.rstrip('/')}/api/metadata/graphql"
+        headers = {
+            "X-Tableau-Auth": self.server.auth_token,
+            "Content-Type":   "application/json",
+        }
+        r = requests.post(url, json={"query": query, "variables": variables or {}},
+                          headers=headers, timeout=300)
+        r.raise_for_status()
+        payload = r.json()
+        if payload.get("errors"):
+            raise RuntimeError(f"GraphQL errors: {payload['errors']}")
+        return payload["data"]
+
+    def metadata_published_datasources(self) -> list[dict]:
+        query = """
+        query PublishedDS {
+          publishedDatasources {
+            id
+            luid
+            name
+            isCertified
+            certificationNote
+            description
+            hasExtracts
+            extractLastRefreshTime
+            owner { username name }
+            projectName
+            upstreamTables { fullName schema database { name connectionType } }
+            upstreamDatabases { name connectionType isEmbedded }
+          }
+        }
+        """
+        return self.metadata_query(query)["publishedDatasources"]
+
+    def metadata_workbook_lineage(self) -> list[dict]:
+        """Workbook -> upstream tables/databases lineage via Metadata API."""
+        query = """
+        query WBLineage {
+          workbooks {
+            luid
+            name
+            projectName
+            upstreamDatabases { name connectionType }
+            upstreamTables { fullName schema database { name connectionType } }
+            embeddedDatasources { name hasExtracts upstreamTables { fullName } }
+          }
+        }
+        """
+        return self.metadata_query(query)["workbooks"]
+
+    # ---- Downloads --------------------------------------------------------
+
+    def download_workbook(self, wb_id: str, dest: Path) -> Path | None:
+        try:
+            file_path = self.server.workbooks.download(
+                wb_id, filepath=str(dest), no_extract=True, include_extract=False
+            )
+            return Path(file_path)
+        except TypeError:
+            # older TSC: only no_extract
+            file_path = self.server.workbooks.download(wb_id, filepath=str(dest), no_extract=True)
+            return Path(file_path)
+        except Exception as e:
+            log.warning("download failed for %s: %s", wb_id, e)
+            return None
+
+
+# ---------------------------------------------------------------------------
+# 2. Workbook XML parser
+# ---------------------------------------------------------------------------
+
+LOD_RE          = re.compile(r"\{\s*(FIXED|INCLUDE|EXCLUDE)\b", re.IGNORECASE)
+TABLE_CALC_RE   = re.compile(r"\b(WINDOW_\w+|RUNNING_\w+|LOOKUP|RANK|INDEX|FIRST|LAST|PREVIOUS_VALUE|TOTAL|SCRIPT_\w+)\s*\(", re.IGNORECASE)
+DATE_FN_RE      = re.compile(r"\b(DATEPART|DATEDIFF|DATEADD|DATETRUNC|DATENAME|TODAY|NOW|MAKEDATE|MAKETIME)\s*\(", re.IGNORECASE)
+COND_RE         = re.compile(r"\b(IF|IIF|ELSEIF|CASE|WHEN)\b", re.IGNORECASE)
+USER_FN_RE      = re.compile(r"\b(USERNAME|USERDOMAIN|ISMEMBEROF|FULLNAME|ISUSERNAME)\s*\(", re.IGNORECASE)
+PARAM_REF_RE    = re.compile(r"\[Parameters\]\.")
+
+
+@dataclass
+class WorkbookSummary:
+    wb_id: str
+    wb_file: str
+    sheet_count: int = 0
+    dashboard_count: int = 0
+    story_count: int = 0
+    calc_count: int = 0
+    lod_fixed: int = 0
+    lod_include: int = 0
+    lod_exclude: int = 0
+    table_calcs: int = 0
+    date_calcs: int = 0
+    conditional_calcs: int = 0
+    user_func_calcs: int = 0
+    parameter_count: int = 0
+    set_count: int = 0
+    group_count: int = 0
+    bin_count: int = 0
+    custom_sql_count: int = 0
+    initial_sql_count: int = 0
+    join_count: int = 0
+    union_count: int = 0
+    stored_proc_count: int = 0
+    extract_count: int = 0
+    live_connection_count: int = 0
+    datasource_filter_count: int = 0
+    extract_filter_count: int = 0
+    user_filter_count: int = 0
+    xml_hash: str = ""
+    parse_error: str = ""
+
+
+def parse_workbook(twbx_path: Path, wb_id: str) -> tuple[WorkbookSummary, list[dict], list[dict]]:
+    """Return (summary, calc_rows, sql_rows) for a single workbook."""
+    summary = WorkbookSummary(wb_id=wb_id, wb_file=twbx_path.name)
+    calcs: list[dict] = []
+    sqls:  list[dict] = []
+
+    try:
+        twb_xml = _read_twb_xml(twbx_path)
+    except Exception as e:
+        summary.parse_error = f"unzip/read: {e}"
+        return summary, calcs, sqls
+
+    try:
+        # Hash of normalized XML for duplicate detection (Step 5)
+        normalized = re.sub(rb'\s+', b' ', twb_xml).strip()
+        summary.xml_hash = hashlib.sha256(normalized).hexdigest()
+
+        root = etree.fromstring(twb_xml)
+
+        summary.sheet_count     = len(root.xpath("//worksheet"))
+        summary.dashboard_count = len(root.xpath("//dashboard"))
+        summary.story_count     = len(root.xpath("//story"))
+        summary.parameter_count = len(root.xpath("//column[@param-domain-type]"))
+        summary.set_count       = len(root.xpath("//groupfilter[@function='member']"))
+        summary.group_count     = len(root.xpath("//group[not(ancestor::groupfilter)]"))
+        summary.bin_count       = len(root.xpath("//column[@type='quantitative' and bin]"))
+        summary.user_filter_count = len(root.xpath("//user-filter"))
+        summary.datasource_filter_count = len(root.xpath("//datasource-filter"))
+        summary.extract_filter_count    = len(root.xpath("//extract//filter"))
+
+        # Connections / extracts
+        for conn in root.xpath("//connection[@class]"):
+            klass = conn.get("class")
+            if klass == "extract" or conn.find("..//extract") is not None:
+                summary.extract_count += 1
+            else:
+                summary.live_connection_count += 1
+            # Initial SQL
+            init = conn.get("one-time-sql") or ""
+            if init.strip():
+                summary.initial_sql_count += 1
+                sqls.append({
+                    "wb_id": wb_id, "kind": "initial_sql",
+                    "datasource": _nearest_ds_name(conn),
+                    "connection_class": klass,
+                    "sql_text": init,
+                    "length": len(init),
+                })
+
+        # Custom SQL / joins / unions / stored procs
+        for rel in root.xpath("//relation[@type]"):
+            rtype = rel.get("type")
+            if rtype == "text":
+                txt = (rel.text or "").strip()
+                if txt:
+                    summary.custom_sql_count += 1
+                    sqls.append({
+                        "wb_id": wb_id, "kind": "custom_sql",
+                        "datasource": _nearest_ds_name(rel),
+                        "connection_class": _nearest_conn_class(rel),
+                        "sql_text": txt,
+                        "length": len(txt),
+                    })
+            elif rtype == "join":
+                summary.join_count += 1
+            elif rtype == "union":
+                summary.union_count += 1
+            elif rtype == "stored-proc":
+                summary.stored_proc_count += 1
+                sqls.append({
+                    "wb_id": wb_id, "kind": "stored_proc",
+                    "datasource": _nearest_ds_name(rel),
+                    "connection_class": _nearest_conn_class(rel),
+                    "sql_text": rel.get("name", ""),
+                    "length": len(rel.get("name", "")),
+                })
+
+        # Calculated fields
+        for col in root.xpath("//column[calculation]"):
+            calc_node = col.find("calculation")
+            formula = calc_node.get("formula") or ""
+            if not formula.strip():
+                continue
+            summary.calc_count += 1
+
+            lod_kind = LOD_RE.findall(formula)
+            for kind in lod_kind:
+                if kind.upper() == "FIXED":   summary.lod_fixed += 1
+                elif kind.upper() == "INCLUDE": summary.lod_include += 1
+                elif kind.upper() == "EXCLUDE": summary.lod_exclude += 1
+
+            is_table_calc = bool(TABLE_CALC_RE.search(formula))
+            is_date       = bool(DATE_FN_RE.search(formula))
+            is_cond       = bool(COND_RE.search(formula))
+            is_user       = bool(USER_FN_RE.search(formula))
+            param_refs    = len(PARAM_REF_RE.findall(formula))
+
+            if is_table_calc: summary.table_calcs += 1
+            if is_date:       summary.date_calcs += 1
+            if is_cond:       summary.conditional_calcs += 1
+            if is_user:       summary.user_func_calcs += 1
+
+            calcs.append({
+                "wb_id":       wb_id,
+                "calc_name":   col.get("caption") or col.get("name"),
+                "datasource":  _nearest_ds_name(col),
+                "datatype":    col.get("datatype"),
+                "role":        col.get("role"),
+                "is_lod":      bool(lod_kind),
+                "lod_kinds":   ",".join(lod_kind),
+                "is_table_calc": is_table_calc,
+                "is_date":     is_date,
+                "is_conditional": is_cond,
+                "is_user_function": is_user,
+                "param_refs":  param_refs,
+                "formula":     formula,
+                "formula_len": len(formula),
+            })
+
+    except Exception as e:
+        summary.parse_error = f"parse: {e}"
+
+    return summary, calcs, sqls
+
+
+def _read_twb_xml(twbx_path: Path) -> bytes:
+    """Return the .twb XML bytes, whether the file is a .twb or .twbx."""
+    if twbx_path.suffix.lower() == ".twb":
+        return twbx_path.read_bytes()
+    with zipfile.ZipFile(twbx_path) as z:
+        twb_name = next((n for n in z.namelist() if n.endswith(".twb")), None)
+        if not twb_name:
+            raise FileNotFoundError(f"No .twb inside {twbx_path}")
+        return z.read(twb_name)
+
+
+def _nearest_ds_name(node) -> str:
+    p = node
+    while p is not None:
+        if p.tag == "datasource":
+            return p.get("caption") or p.get("name") or ""
+        p = p.getparent()
+    return ""
+
+
+def _nearest_conn_class(node) -> str:
+    p = node
+    while p is not None:
+        c = p.find(".//connection[@class]")
+        if c is not None:
+            return c.get("class")
+        p = p.getparent()
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# 3. Repository (PostgreSQL workgroup) queries
+# ---------------------------------------------------------------------------
+
+def repo_connect(cfg: dict):
+    if not HAS_PSYCOPG2:
+        raise RuntimeError("psycopg2-binary not installed; pip install psycopg2-binary")
+    return psycopg2.connect(
+        host=cfg["REPO_HOST"], port=cfg["REPO_PORT"],
+        dbname=cfg["REPO_DB"], user=cfg["REPO_USER"], password=cfg["REPO_PASSWORD"],
+        connect_timeout=15,
+    )
+
+
+def repo_run_named(conn, name: str, sql: str) -> list[dict]:
+    log.info("Running repo query: %s", name)
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        try:
+            cur.execute(sql)
+            return [dict(r) for r in cur.fetchall()]
+        except Exception as e:
+            log.warning("Query %s failed: %s", name, e)
+            conn.rollback()
+            return []
+
+
+def parse_sql_file(path: Path) -> dict[str, str]:
+    """Parse the .sql file into {name: sql} using -- name: <key> markers."""
+    text = path.read_text(encoding="utf-8")
+    blocks: dict[str, list[str]] = {}
+    current = None
+    for line in text.splitlines():
+        m = re.match(r"--\s*name:\s*(\S+)", line)
+        if m:
+            current = m.group(1).strip()
+            blocks[current] = []
+        elif current is not None:
+            blocks[current].append(line)
+    return {k: "\n".join(v).strip() for k, v in blocks.items()}
+
+
+# ---------------------------------------------------------------------------
+# 4. Scoring & classification (Steps 7, 8, 9)
+# ---------------------------------------------------------------------------
+
+def score_workbook(row: dict) -> dict:
+    """Apply the rubric from the assessment guide to a flattened workbook row."""
+    def bucket(val, low, mid):
+        if val is None: return 1
+        if val <= low:  return 1
+        if val <= mid:  return 2
+        return 3
+
+    s_dashboards = bucket(row.get("dashboard_count", 0), 2, 5)
+    s_datasources = bucket(row.get("datasource_count", 0), 1, 3)
+    s_custom_sql = bucket(row.get("custom_sql_total_len", 0), 0, 500)
+    s_calcs      = bucket(row.get("calc_count", 0), 10, 30)
+    s_lods       = bucket(row.get("lod_total", 0), 0, 5)
+    s_security   = (3 if row.get("user_filter_count", 0) > 0
+                    else 2 if row.get("permission_overrides", 0) > 0
+                    else 1)
+    s_usage      = (3 if row.get("views_12mo", 0) >= 500
+                    else 2 if row.get("views_12mo", 0) >= 50
+                    else 1)
+    total = s_dashboards + s_datasources + s_custom_sql + s_calcs + s_lods + s_security + s_usage
+
+    if total <= 9:    bucket_label = "Simple"
+    elif total <= 14: bucket_label = "Medium"
+    elif total <= 18: bucket_label = "Complex"
+    else:             bucket_label = "Highly Complex"
+
+    base_days = {"Simple": 3, "Medium": 7, "Complex": 14, "Highly Complex": 25}[bucket_label]
+    multiplier = (
+        (1 + 0.10 * row.get("lod_total", 0))
+        * (1 + 0.05 * row.get("custom_sql_count", 0))
+        * (1.20 if row.get("user_filter_count", 0) > 0 else 1.0)
+        * (1.25 if row.get("views_12mo", 0) >= 500 else 1.0)
+    )
+    effort_days = round(base_days * multiplier, 1)
+
+    # Classification (Step 9)
+    last_view = row.get("last_accessed")
+    views_12 = row.get("views_12mo", 0) or 0
+    if (pd.isna(last_view) if last_view is not None else True) or views_12 == 0:
+        classification = "Retire"
+    elif row.get("duplicate_group"):
+        classification = "Retire (duplicate)"
+    elif row.get("table_calcs", 0) >= 5 and row.get("lod_total", 0) >= 5:
+        classification = "Rebuild"
+    else:
+        classification = bucket_label
+
+    return {
+        "score_dashboards": s_dashboards,
+        "score_datasources": s_datasources,
+        "score_custom_sql":  s_custom_sql,
+        "score_calcs":       s_calcs,
+        "score_lods":        s_lods,
+        "score_security":    s_security,
+        "score_usage":       s_usage,
+        "score_total":       total,
+        "complexity_bucket": bucket_label,
+        "effort_days":       effort_days,
+        "classification":    classification,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 5. Phase implementations
+# ---------------------------------------------------------------------------
+
+def _tag(rows: list[dict], site_label: str) -> list[dict]:
+    """Add a 'site' column to every row dict in-place."""
+    for r in rows:
+        r["site"] = site_label
+    return rows
+
+
+def phase_inventory(cfg: dict):
+    """Step 1, 4, 6: REST API + Metadata API — iterates all configured sites."""
+    site_ids: list[str] = cfg.get("SITE_IDS", [""])
+
+    all_workbooks: list[dict] = []
+    all_views:     list[dict] = []
+    all_ds:        list[dict] = []
+    all_users:     list[dict] = []
+    all_groups:    list[dict] = []
+    all_subs:      list[dict] = []
+    all_scheds:    list[dict] = []
+    all_perms:     list[dict] = []
+    all_meta_ds:   list[dict] = []
+    all_lineage:   list[dict] = []
+
+    for site_id in site_ids:
+        site_label = site_id or "Default"
+        log.info("==== Inventory: site '%s' ====", site_label)
+        with TableauClient(site_id) as tc:
+            all_workbooks.extend(_tag(tc.list_workbooks(),    site_label))
+            all_views.extend(    _tag(tc.list_views(),        site_label))
+            all_ds.extend(       _tag(tc.list_datasources(),  site_label))
+            all_users.extend(    _tag(tc.list_users(),        site_label))
+            all_groups.extend(   _tag(tc.list_groups(),       site_label))
+            all_subs.extend(     _tag(tc.list_subscriptions(),site_label))
+            all_scheds.extend(   _tag(tc.list_schedules(),    site_label))
+
+            # Permissions: workbooks, projects, datasources
+            wb_items = list(TSC.Pager(tc.server.workbooks))
+            ds_items = list(TSC.Pager(tc.server.datasources))
+            pj_items = list(TSC.Pager(tc.server.projects))
+            perm_rows: list[dict] = []
+            perm_rows += tc.list_permissions(wb_items, tc.server.workbooks.populate_permissions, "workbook")
+            perm_rows += tc.list_permissions(ds_items, tc.server.datasources.populate_permissions, "datasource")
+            perm_rows += tc.list_permissions(pj_items, tc.server.projects.populate_permissions, "project")
+            all_perms.extend(_tag(perm_rows, site_label))
+
+            # Metadata API enrichment
+            try:
+                all_meta_ds.extend(_tag(tc.metadata_published_datasources(), site_label))
+            except Exception as e:
+                log.warning("[%s] metadata_published_datasources failed: %s", site_label, e)
+            try:
+                for wb in tc.metadata_workbook_lineage():
+                    for t in wb.get("upstreamTables") or []:
+                        all_lineage.append({
+                            "site":              site_label,
+                            "wb_luid":           wb["luid"],
+                            "wb_name":           wb["name"],
+                            "project":           wb.get("projectName"),
+                            "upstream_table":    t.get("fullName"),
+                            "upstream_schema":   t.get("schema"),
+                            "upstream_database": (t.get("database") or {}).get("name"),
+                            "connection_type":   (t.get("database") or {}).get("connectionType"),
+                        })
+            except Exception as e:
+                log.warning("[%s] metadata_workbook_lineage failed: %s", site_label, e)
+
+    write_csv(all_workbooks, "01_workbooks.csv")
+    write_csv(all_views,     "02_views.csv")
+    write_csv(all_ds,        "03_datasources.csv")
+    write_csv(all_users,     "04_users.csv")
+    write_csv(all_groups,    "05_groups.csv")
+    write_csv(all_subs,      "06_subscriptions.csv")
+    write_csv(all_scheds,    "07_schedules.csv")
+    write_csv(all_perms,     "08_permissions.csv")
+    write_csv(all_meta_ds,   "09_metadata_datasources.csv")
+    write_csv(all_lineage,   "10_metadata_wb_lineage.csv")
+
+
+def phase_download(cfg: dict):
+    """Download every workbook (no_extract) for XML parsing, grouped by site."""
+    download_dir = staging_path("workbooks")
+    download_dir.mkdir(exist_ok=True)
+    wbs = read_csv("01_workbooks.csv")
+    if wbs.empty:
+        log.error("Run --phase inventory first (no 01_workbooks.csv).")
+        return
+
+    # Group by site so we sign in only once per site
+    if "site" in wbs.columns:
+        groups = list(wbs.groupby("site"))
+    else:
+        groups = [("Default", wbs)]
+
+    for site_label, group in groups:
+        site_id = "" if site_label == "Default" else site_label
+        log.info("Downloading workbooks for site '%s' (%d total).", site_label, len(group))
+        with TableauClient(site_id) as tc:
+            for _, row in group.iterrows():
+                wb_id = row["wb_id"]
+                dest_stub = download_dir / wb_id  # TSC will append .twbx/.twb
+                if list(download_dir.glob(f"{wb_id}.*")):
+                    continue
+                tc.download_workbook(wb_id, dest_stub)
+
+
+def phase_parse(cfg: dict):
+    download_dir = staging_path("workbooks")
+    files = sorted(list(download_dir.glob("*.twbx")) + list(download_dir.glob("*.twb")))
+    if not files:
+        log.error("No workbook files in %s. Run --phase download first.", download_dir)
+        return
+    summaries, calcs, sqls = [], [], []
+    for f in files:
+        wb_id = f.stem
+        s, c, q = parse_workbook(f, wb_id)
+        summaries.append(s.__dict__)
+        calcs.extend(c)
+        sqls.extend(q)
+    write_csv(summaries, "11_xml_summary.csv")
+    write_csv(calcs,     "12_calculations.csv")
+    write_csv(sqls,      "13_sql_blocks.csv")
+
+
+def phase_repo(cfg: dict):
+    """Step 1 (last viewed/usage), 5 (rationalization), 6 (extra security)."""
+    if not cfg["REPO_PASSWORD"]:
+        log.warning("REPO_PASSWORD not set; skipping PostgreSQL phase.")
+        return
+    sql_file = cfg["SQL_FILE"]
+    if not sql_file.exists():
+        log.error("SQL file not found: %s", sql_file)
+        return
+    queries = parse_sql_file(sql_file)
+    log.info("Loaded %d named queries from %s", len(queries), sql_file.name)
+
+    conn = repo_connect(cfg)
+    try:
+        for name, sql in queries.items():
+            rows = repo_run_named(conn, name, sql)
+            write_csv(rows, f"repo_{name}.csv")
+    finally:
+        conn.close()
+
+
+def phase_score(cfg: dict):
+    """Combine intermediate CSVs and apply scoring."""
+    wbs    = read_csv("01_workbooks.csv")
+    xml    = read_csv("11_xml_summary.csv")
+    calcs  = read_csv("12_calculations.csv")
+    sqls   = read_csv("13_sql_blocks.csv")
+    usage  = read_csv("repo_workbook_usage.csv")
+    perms  = read_csv("08_permissions.csv")
+
+    if wbs.empty:
+        log.error("No inventory data; run earlier phases first.")
+        return
+
+    # Aggregations
+    sql_agg = (sqls.groupby("wb_id")["length"].agg(["count", "sum"])
+                   .rename(columns={"count": "custom_sql_count", "sum": "custom_sql_total_len"})
+                   .reset_index() if not sqls.empty else
+               pd.DataFrame(columns=["wb_id", "custom_sql_count", "custom_sql_total_len"]))
+
+    if not xml.empty:
+        xml["lod_total"] = xml["lod_fixed"] + xml["lod_include"] + xml["lod_exclude"]
+        xml["datasource_count"] = xml.get("live_connection_count", 0) + xml.get("extract_count", 0)
+    else:
+        xml = pd.DataFrame(columns=["wb_id"])
+
+    perm_agg = (perms.assign(is_override=lambda d: d["mode"] == "Deny")
+                     .groupby("object_id")["is_override"].sum()
+                     .rename("permission_overrides").reset_index()
+                     .rename(columns={"object_id": "wb_id"})
+                if not perms.empty else
+                pd.DataFrame(columns=["wb_id", "permission_overrides"]))
+
+    df = (wbs.merge(xml, on="wb_id", how="left")
+              .merge(sql_agg, on="wb_id", how="left")
+              .merge(perm_agg, on="wb_id", how="left"))
+    if not usage.empty and "wb_id" in usage.columns:
+        df = df.merge(usage, on="wb_id", how="left")
+
+    # Duplicate detection by xml_hash
+    if "xml_hash" in df.columns:
+        dup_counts = df["xml_hash"].value_counts()
+        df["duplicate_group"] = df["xml_hash"].map(lambda h: dup_counts.get(h, 0) > 1 if pd.notna(h) else False)
+    else:
+        df["duplicate_group"] = False
+
+    # Apply scoring
+    score_rows = df.fillna(0).to_dict(orient="records")
+    scored = [{**r, **score_workbook(r)} for r in score_rows]
+    write_csv(scored, "14_scored.csv")
+
+
+def phase_report(cfg: dict):
+    """Build the final Excel deliverable."""
+    out = cfg["OUTPUT_XLSX"]
+    sheets = {
+        "Summary":         _summary_sheet(),
+        "Inventory":       read_csv("01_workbooks.csv"),
+        "Views":           read_csv("02_views.csv"),
+        "DataSources":     read_csv("03_datasources.csv"),
+        "Users":           read_csv("04_users.csv"),
+        "Groups":          read_csv("05_groups.csv"),
+        "Subscriptions":   read_csv("06_subscriptions.csv"),
+        "Schedules":       read_csv("07_schedules.csv"),
+        "Permissions":     read_csv("08_permissions.csv"),
+        "MetaDS":          read_csv("09_metadata_datasources.csv"),
+        "Lineage":         read_csv("10_metadata_wb_lineage.csv"),
+        "XMLSummary":      read_csv("11_xml_summary.csv"),
+        "Calcs":           read_csv("12_calculations.csv"),
+        "SQL":             read_csv("13_sql_blocks.csv"),
+        "Score":           read_csv("14_scored.csv"),
+        "Usage":           read_csv("repo_workbook_usage.csv"),
+        "InactiveOwners":  read_csv("repo_inactive_owners.csv"),
+        "RepoSubs":        read_csv("repo_subscriptions.csv"),
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(out, engine="openpyxl") as writer:
+        for name, df in sheets.items():
+            if df is None or (hasattr(df, "empty") and df.empty):
+                pd.DataFrame({"note": [f"No data for {name}"]}).to_excel(writer, sheet_name=name[:31], index=False)
+            else:
+                df.to_excel(writer, sheet_name=name[:31], index=False)
+    log.info("Wrote %s", out)
+
+
+def _summary_sheet() -> pd.DataFrame:
+    scored = read_csv("14_scored.csv")
+    if scored.empty:
+        return pd.DataFrame({"note": ["Run --phase score first"]})
+    by_class = scored["classification"].value_counts().rename_axis("classification").reset_index(name="count")
+    by_bucket = scored["complexity_bucket"].value_counts().rename_axis("complexity_bucket").reset_index(name="count")
+    total_effort = scored["effort_days"].sum()
+    summary = pd.DataFrame([
+        {"metric": "Total workbooks",     "value": len(scored)},
+        {"metric": "Total effort (days)", "value": round(total_effort, 1)},
+        {"metric": "Total effort (FTE-years @220 days)", "value": round(total_effort / 220, 2)},
+    ])
+    return pd.concat([summary,
+                      pd.DataFrame([{"metric": "--- by classification ---", "value": ""}]),
+                      by_class.rename(columns={"classification": "metric", "count": "value"}),
+                      pd.DataFrame([{"metric": "--- by complexity ---", "value": ""}]),
+                      by_bucket.rename(columns={"complexity_bucket": "metric", "count": "value"})],
+                     ignore_index=True)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+PHASES = {
+    "inventory": phase_inventory,
+    "download":  phase_download,
+    "parse":     phase_parse,
+    "repo":      phase_repo,
+    "score":     phase_score,
+    "report":    phase_report,
+}
+
+
+# ---------------------------------------------------------------------------
+# Site resolution helpers
+# ---------------------------------------------------------------------------
+
+def _normalize_site_id(raw: str) -> str:
+    normalized = raw.strip()
+    return "" if normalized.lower() in {"", "default"} else normalized
+
+
+def _discover_all_sites() -> list[str]:
+    server, tableau_auth = get_server(site_id_override="")
+    sites: list[str] = []
+    with server.auth.sign_in(tableau_auth):
+        for site in TSC.Pager(server.sites):
+            content_url = _normalize_site_id(str(getattr(site, "content_url", "")))
+            if content_url not in sites:
+                sites.append(content_url)
+    return sites
+
+
+def _resolve_sites(requested: list[str]) -> list[str]:
+    try:
+        actual = _discover_all_sites()
+        log.info("Available sites on server: %s", actual or ["Default"])
+        lower_map = {s.lower(): s for s in actual}
+        resolved: list[str] = []
+        for s in requested:
+            key = s.lower()
+            if key in lower_map:
+                resolved.append(lower_map[key])
+            else:
+                log.warning("Site '%s' not found on server; skipping.", s or "Default")
+        return resolved if resolved else requested
+    except Exception as exc:
+        log.warning("Could not resolve sites against server: %s. Using names as-is.", exc)
+        return requested
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    p = argparse.ArgumentParser(description="Tableau -> Power BI migration assessment")
+    p.add_argument("--phase", choices=list(PHASES.keys()) + ["all"], default="all")
+    p.add_argument(
+        "--site", action="append", default=[], metavar="SITE",
+        help="Site contentUrl. Repeat or comma-separate. Use 'Default' for the default site.",
+    )
+    p.add_argument(
+        "--all-sites", action="store_true",
+        help="Discover and extract all visible sites automatically",
+    )
+    p.add_argument(
+        "--site-file", default=None,
+        help=f"Path to file listing site contentUrls (default: {HARDCODED_SITES_FILE})",
+    )
+    p.add_argument("--config-dump", action="store_true", help="Print resolved config and exit")
+    args = p.parse_args()
+
+    cfg = dict(DEFAULTS)
+    if args.config_dump:
+        print(json.dumps(
+            {k: (str(v) if isinstance(v, Path) else v) for k, v in cfg.items() if "PASSWORD" not in k},
+            indent=2, default=str,
+        ))
+        return
+
+    # Resolve target sites
+    if args.all_sites:
+        site_ids = _discover_all_sites()
+        log.info("Discovered %d site(s): %s", len(site_ids), [s or "Default" for s in site_ids])
+    else:
+        raw_sites: list[str] = []
+        for raw in args.site:
+            for part in raw.split(","):
+                s = _normalize_site_id(part)
+                if s not in raw_sites:
+                    raw_sites.append(s)
+
+        site_file = Path(args.site_file) if args.site_file else HARDCODED_SITES_FILE
+        if site_file.exists():
+            log.info("Reading sites from: %s", site_file)
+            for line in site_file.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                for part in line.split(","):
+                    s = _normalize_site_id(part)
+                    if s not in raw_sites:
+                        raw_sites.append(s)
+
+        if not raw_sites:
+            log.warning("No sites specified; defaulting to the Default site.")
+            raw_sites = [""]
+
+        site_ids = _resolve_sites(raw_sites)
+
+    log.info("Target sites: %s", [s or "Default" for s in site_ids])
+    cfg["SITE_IDS"] = site_ids
+
+    if args.phase == "all":
+        for name, fn in PHASES.items():
+            log.info("==== PHASE: %s ====", name)
+            fn(cfg)
+    else:
+        PHASES[args.phase](cfg)
+
+
+if __name__ == "__main__":
+    main()
