@@ -3,8 +3,8 @@
   "_usage":   "Copy to config.json, fill in your values, then run: python tableau_assessment_extractor.py --config config.json",
 
   "pg_host":             "localhost",
-  "pg_port":             8060,
-  "pg_database":         "workgroup",
+  "pg_port":             <your port>,
+  "pg_database":         "<your db name>",
   "pg_user":             "readonly",
   "pg_password":         "YOUR_POSTGRES_PASSWORD_HERE",
   "pg_connect_timeout":  30,
