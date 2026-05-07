@@ -1,0 +1,15 @@
+# Tableau Assessment Extractor — Python dependencies
+# Install with: pip install -r requirements.txt
+#
+# Python 3.8+ required
+
+# ── Metadata API extractor (tableau_metadata_api_extractor.py) ─────────────
+requests>=2.28.0           # HTTP client for REST + GraphQL calls
+urllib3>=1.26.0            # Retry/backoff adapter (bundled with requests)
+openpyxl>=3.1.0            # Excel (.xlsx) writer
+
+# ── PostgreSQL extractor (tableau_pg_extractor.py) ─────────────────────────
+psycopg2-binary>=2.9.0     # PostgreSQL adapter (binary wheel — no libpq needed)
+
+# ── Optional utilities ──────────────────────────────────────────────────────
+pandas>=1.5.0              # Optional: data preview / quick local analysis

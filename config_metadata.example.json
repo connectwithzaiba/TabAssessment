@@ -1,0 +1,39 @@
+{
+  "_comment": "Tableau Metadata API Extractor — Configuration",
+  "_usage":   "Copy to config_metadata.json, fill in your values, then run: python tableau_metadata_api_extractor.py --config config_metadata.json",
+
+  "_credential_options": [
+    "Option A (RECOMMENDED) — leave username and password blank here.",
+    "  The script will prompt you securely at runtime (password is never echoed).",
+    "Option B — set TABLEAU_USERNAME and TABLEAU_PASSWORD environment variables.",
+    "  export TABLEAU_USERNAME=admin",
+    "  export TABLEAU_PASSWORD=secret   (Linux/Mac)",
+    "  set TABLEAU_PASSWORD=secret      (Windows CMD)",
+    "Option C — fill in username/password below (not recommended for shared machines)."
+  ],
+
+  "server_url":        "https://your-tableau-server",
+  "api_version":       "3.21",
+  "username":          "",
+  "password":          "",
+
+  "site_content_url":  "all",
+
+  "verify_ssl":        true,
+  "page_size":         100,
+  "request_timeout":   60,
+  "max_retries":       3,
+
+  "inactive_owner_days":   90,
+  "unused_view_threshold": 0,
+
+  "output_dir":        "./tableau_assessment_output",
+  "log_level":         "INFO",
+  "log_file":          "tableau_metadata_extractor.log",
+
+  "_notes": {
+    "server_url":            "Your Tableau Server URL, e.g. https://tableau.yourcompany.com — no trailing slash",
+    "api_version":           "Tableau Server 2023.3 uses REST API version 3.21. Check via: https://<server>/api/2.3/serverinfo",
+    "username":              "Leave blank to be prompted at runtime. Or set TABLEAU_USERNAME env var.",
+    "password":              "Leave blank to be prompted securely at runtime. Or set TABLEAU_PASSWORD env var. Never store plaintext passwords in shared config files.",
+    "site_content_url":      "Use 'all' to scan every site. Use '' (empty string) f

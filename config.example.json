@@ -1,0 +1,26 @@
+{
+  "_comment": "Tableau Assessment Extractor — Configuration Template",
+  "_usage":   "Copy to config.json, fill in your values, then run: python tableau_assessment_extractor.py --config config.json",
+
+  "pg_host":             "localhost",
+  "pg_port":             8060,
+  "pg_database":         "workgroup",
+  "pg_user":             "readonly",
+  "pg_password":         "YOUR_POSTGRES_PASSWORD_HERE",
+  "pg_connect_timeout":  30,
+  "pg_application_name": "tableau_assessment_extractor",
+
+  "output_dir":  "./tableau_assessment_output",
+  "batch_size":  50,
+
+  "log_level":   "INFO",
+  "log_file":    "tableau_extractor.log",
+
+  "_notes": {
+    "pg_host":  "Use 'localhost' when running on the Tableau Server machine itself. For remote access, SSH-tunnel first: ssh -L 15432:localhost:8060 tableau-server",
+    "pg_port":  "Tableau Server's dedicated internal Postgres port. Default 8060. Verify with: tsm configuration get -k pgsql.port",
+    "pg_user":  "The built-in read-only user. On Tableau Server 2019+ this is often 'readonly'. On older versions try 'tblwgadmin'. Check with: tsm configuration get -k pgsql.readonly_username",
+    "batch_size": "Number of workbooks fetched per SQL round-trip. Reduce to 20 if memory is limited; increase to 200 on fast servers.",
+    "log_level": "INFO for production. Use DEBUG to see per-workbook XML parse details."
+  }
+}
