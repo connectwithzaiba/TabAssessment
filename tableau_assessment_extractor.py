@@ -57,8 +57,8 @@ from openpyxl.utils import get_column_letter
 
 DEFAULT_CONFIG: Dict = {
     "pg_host":             "localhost",
-    "pg_port":             8060,
-    "pg_database":         "workgroup",
+    "pg_port":             <<ur port>>,
+    "pg_database":         "<<ur db name>>",
     "pg_user":             "readonly",
     "pg_password":         "",          # Prefer env var TABLEAU_PG_PASSWORD
     "pg_connect_timeout":  30,
